@@ -11,6 +11,7 @@ partenza, argomenti e variabili LLAMA_ARG_* comprese.
 """
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -94,13 +95,13 @@ def operaio(url, coda, fd, stato, blocco):
                 time.sleep(2 * (tentativo + 1))
 
 
-def scarica(url, totale):
+def scarica(url, totale, dest):
     coda = queue.Queue()
     for inizio in range(0, totale, PEZZO):
         coda.put((inizio, min(PEZZO, totale - inizio)))
     attesi = coda.qsize()
 
-    fd = os.open(DEST + ".parziale", os.O_WRONLY | os.O_CREAT, 0o644)
+    fd = os.open(dest + ".parziale", os.O_WRONLY | os.O_CREAT, 0o644)
     try:
         # il file nasce gia' della dimensione finale: i thread scrivono ognuno al proprio offset
         os.ftruncate(fd, totale)
@@ -131,27 +132,58 @@ def scarica(url, totale):
     # la dimensione non prova niente, il file e' preallocato: contano i pezzi completati
     if stato["pezzi"] != attesi:
         raise RuntimeError(f"completati {stato['pezzi']} pezzi su {attesi}")
-    os.rename(DEST + ".parziale", DEST)
+    os.rename(dest + ".parziale", dest)
+
+
+def parti(nome):
+    """I GGUF grossi arrivano in piu' file: da -00001-of-00003 si ricavano tutti gli altri."""
+    trovato = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", nome)
+    if not trovato:
+        return [nome]
+    quante = int(trovato.group(2))
+    radice = nome[: trovato.start()]
+    return [f"{radice}-{i:05d}-of-{quante:05d}.gguf" for i in range(1, quante + 1)]
+
+
+def porta_giu(url, dest):
+    totale, url_finale = dimensione_e_url(url)
+    if os.path.exists(dest) and os.path.getsize(dest) == totale:
+        log(f"{dest} c'e' gia' ed e' della dimensione giusta, non riscarico")
+        return
+    log(f"{totale / 1e9:.1f} GB da {url} con {CONNESSIONI} connessioni")
+    partenza = time.time()
+    scarica(url_finale, totale, dest)
+    durata = time.time() - partenza
+    log(f"finito in {durata / 60:.1f} minuti, media {totale / durata / 1e6:.0f} MB/s")
 
 
 def main():
     if not REPO and not URL:
         avvia()
 
-    url = URL or f"https://huggingface.co/{REPO}/resolve/{REVISIONE}/{FILE}"
-    totale, url_finale = dimensione_e_url(url)
-
-    if os.path.exists(DEST) and os.path.getsize(DEST) == totale:
-        log(f"{DEST} c'e' gia' ed e' della dimensione giusta, non riscarico")
+    if URL:
+        porta_giu(URL, DEST)
+        modello = DEST
     else:
-        log(f"{totale / 1e9:.1f} GB da {url} con {CONNESSIONI} connessioni")
-        partenza = time.time()
-        scarica(url_finale, totale)
-        durata = time.time() - partenza
-        log(f"finito in {durata / 60:.1f} minuti, media {totale / durata / 1e6:.0f} MB/s")
+        pezzi = parti(FILE)
+        if len(pezzi) == 1:
+            porta_giu(f"https://huggingface.co/{REPO}/resolve/{REVISIONE}/{FILE}", DEST)
+            modello = DEST
+        else:
+            # llama-server carica da solo le parti successive: basta puntargli la prima,
+            # e i nomi originali devono restare, perche' e' da quelli che le trova
+            cartella = os.path.join(os.path.dirname(DEST) or "/root", "modello")
+            os.makedirs(cartella, exist_ok=True)
+            log(f"{len(pezzi)} parti da mettere in {cartella}")
+            for pezzo in pezzi:
+                porta_giu(
+                    f"https://huggingface.co/{REPO}/resolve/{REVISIONE}/{pezzo}",
+                    os.path.join(cartella, os.path.basename(pezzo)),
+                )
+            modello = os.path.join(cartella, os.path.basename(pezzi[0]))
 
     # llama-server deve leggere il file locale, non rimettersi a scaricare da HuggingFace
-    os.environ["LLAMA_ARG_MODEL"] = DEST
+    os.environ["LLAMA_ARG_MODEL"] = modello
     for chiave in ("LLAMA_ARG_HF_REPO", "LLAMA_ARG_HF_FILE", "LLAMA_ARG_MODEL_URL"):
         os.environ.pop(chiave, None)
     avvia()
